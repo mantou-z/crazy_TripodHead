@@ -1,2 +1,16 @@
 # crazy_TripodHead
- a small tripod head with two motor,and simplefoc
+该仓库用于记录云台制作过程，采用双小型电机GB1105，使用simplefoc进行电机控制，单独设计电机控制板。
+
+## 软件部分
+
+电机驱动方案使用simplefoc+esp32+plantformio。
+
+ **two_motor_control_esp32内环速度模式0324** 为第一版电机控制程序，使用速度模式控制电机，搭配串口通信与上位机电脑进行通信，获取识别物体目前坐标，执行外环pid进行跟踪，但是目前效果不佳，kp较小时电机不能克服磁阻效应，运转卡顿，kp较大会产生抖动。
+
+## 硬件部分
+
+硬件使用esp32-pico-d4作为主控芯片，两片drv8313作为驱动芯片，电路包括降压模块，自动下载模块，电机驱动模块。
+
+## 机械部分
+
+**models** 文件夹包含机械模型，采用3d打印。

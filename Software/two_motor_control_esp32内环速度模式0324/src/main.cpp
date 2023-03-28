@@ -1,0 +1,369 @@
+/*i2c gb1105 与 pwm gb1105 双电机云台测试*/
+#include <SimpleFOC.h>
+#include <HardwareSerial.h> //串口通信用
+
+// 串口初始化  串口0烧写程序使用，云台与视觉算法使用串口1
+HardwareSerial MySerial(1);
+
+// i2c编码器配置
+MagneticSensorI2C sensor_i2c = MagneticSensorI2C(AS5600_I2C);
+TwoWire I2Cone = TwoWire(0);
+
+// pwm编码器配置
+MagneticSensorPWM sensor_pwm = MagneticSensorPWM(15, 4, 904);
+void doPWM() { sensor_pwm.handlePWM(); }
+
+// 电机角度限幅
+float yaw_low = -4;
+float yaw_high = 4;
+float pitch_low = 0;
+float pitch_high = 3;
+
+// 电机对象实例化
+BLDCMotor motor_pitch = BLDCMotor(6); // 必须设置电机的实际极对数，底层代码采用浮点数运算，估算后的极对数经常因为带有浮点数而错误
+BLDCMotor motor_yaw = BLDCMotor(6);
+
+BLDCDriver3PWM driver_yaw = BLDCDriver3PWM(25, 33, 32, 13); // simple foc mini  12, 14, 27, 26   25, 33, 32, 13
+BLDCDriver3PWM driver_pitch = BLDCDriver3PWM(12, 14, 27, 26);
+
+// angle set point variable
+float target_angle_yaw = 0;
+float target_angle_pitch = 0;
+
+// zdx_try
+float loop_angle_1 = -3;
+float loop_angle_2 = 3;
+float action_angle = 0;
+int tt = 0; // 时间标志
+int tt_period = 2000;
+
+// instantiate the commander
+Commander command = Commander(Serial);
+void doTarget_yaw(char *cmd) { command.scalar(&target_angle_yaw, cmd); }
+void doTarget_pitch(char *cmd) { command.scalar(&target_angle_pitch, cmd); }
+void doMotor_yaw(char *cmd) { command.motor(&motor_yaw, cmd); }
+void doMotor_pitch(char *cmd) { command.motor(&motor_pitch, cmd); }
+
+// 串口接收数据函数
+unsigned short i;
+uint8_t j = 0;
+uint8_t camera_buffer[6] = {0, 0, 0, 0, 0, 0};
+int cam_height = 0, cam_width = 0;
+void read_usart()
+{
+  i = MySerial.available(); // 返回目前串口接收区内的已经接受的数据量
+  Serial.println(i);
+  if (i != 0)
+  {
+    while (i--)
+    {
+      // camera_buffer[j] = MySerial.read();
+      // if (camera_buffer[0] != 0xaa)
+      //   j = 0;
+      // else
+      // {
+
+      //   if (j == 6)
+      //     j = 0;
+      //   j++;
+      // }
+      if (j == 6)
+        j = 0;
+      camera_buffer[j] = MySerial.read();
+      j++;
+    }
+    if ((camera_buffer[0] == 0xaa) && (camera_buffer[5] == 0xbb))
+    {
+      int cam_height1 = (camera_buffer[1] << 8 | camera_buffer[2]) - 240;
+      int cam_width1 = (camera_buffer[3] << 8 | camera_buffer[4]) - 320;
+      if (cam_height1 == (-240) || cam_width1 == (-320))
+      {
+        cam_height = 0;
+        cam_width = 0;
+      }
+      else
+      {
+        cam_height = cam_height1;
+        cam_width = cam_width1;
+      }
+      Serial.printf("height width :%d,%d\n", cam_height, cam_width);
+      Serial.println();
+    }
+    else
+    {
+      cam_height = 0;
+      cam_width = 0;
+    }
+  }
+  // else
+  //   Serial.println("no receive");
+}
+
+void clear_usart_buffer()
+{
+  i = MySerial.available();
+  if (i != 0)
+  {
+    Serial.print("清空串口接收区的缓存......");
+    Serial.println(MySerial.available());
+    while (i--)
+      MySerial.read(); // 读取串口接收回来的数据但是不做处理只给与打印
+  }
+  else
+    Serial.println("串口接收区的缓存为空!!!");
+}
+
+// PID结构体
+
+struct PID_version
+{
+  float kp;
+  float ki;
+  float kd;
+  float error_sum;
+  float last_error;
+};
+
+PID_version PID_pitch;
+PID_version PID_yaw;
+
+// PID计算函数
+float PID_Cal(int angle_version, int angle_set, PID_version pid)
+{
+  int32_t error = angle_set - angle_version;
+  pid.error_sum += error;
+  int32_t derivative = error - pid.last_error;
+  pid.last_error = error;
+  float velocity = pid.kp * error + pid.ki * pid.error_sum + pid.kd * derivative;
+
+  // 输出限幅
+  if (velocity >= 20)
+    velocity = 20;
+  if (velocity <= -20)
+    velocity = -20;
+
+  return velocity;
+}
+
+// freertos 多线程电机驱动解算
+void TaskOne_motor_yaw(void *xTask1)
+{
+  while (1)
+  {
+    // read_usart();
+    sensor_i2c.update();
+    Serial.printf("yaw angle: %f", sensor_i2c.getAngle());
+    Serial.println();
+    motor_yaw.loopFOC();
+    // delay(200);
+    /********************************************************/
+    // 偏航电机运动限幅
+    if ((sensor_i2c.getAngle() >= yaw_high) || (sensor_i2c.getAngle() <= yaw_low))
+    {
+      motor_yaw.move(0);
+      Serial.println("yaw cross border!");
+      continue;
+    }
+    if ((cam_width <= 15) && (cam_width >= -15))
+    {
+      motor_yaw.move(0);
+      Serial.println("yaw track ok!");
+    }
+    else
+    {
+      float v1 = PID_Cal(cam_width, 0, PID_yaw);
+      motor_yaw.move(v1);
+      Serial.printf("yaw velocity:%f", v1);
+      Serial.println();
+    }
+
+    /********************************************************/
+
+    // motor_yaw.move(target_angle_yaw);
+    //   // motor_yaw.monitor();
+    // command.run();
+  }
+}
+
+void TaskTwo_motor_pitch(void *xTask2)
+{
+  while (1)
+  {
+    // read_usart();
+    sensor_pwm.update();
+
+    Serial.printf("pitch angle: %f", sensor_pwm.getAngle());
+    Serial.println();
+    motor_pitch.loopFOC();
+    // delay(200);
+
+    /********************************************************/
+    // 俯仰电机运动限幅
+    if ((sensor_pwm.getAngle() >= pitch_high) || (sensor_pwm.getAngle() <= pitch_low))
+    {
+      motor_pitch.move(0);
+      Serial.println("pitch cross border!");
+      continue;
+    }
+    if ((cam_height <= 15) && (cam_height >= -15))
+    {
+      motor_pitch.move(0);
+      Serial.println("pitch track ok!");
+    }
+    else
+    {
+      float v2 = PID_Cal(cam_height, 0, PID_pitch);
+      motor_pitch.move(v2);
+      Serial.printf("trackiung!  pitch velocity is:%f", v2);
+      Serial.println();
+    }
+
+    /********************************************************/
+
+    // motor_pitch.move(target_angle_pitch);
+    //    motor_pitch.monitor();
+    // command.run();
+  }
+}
+
+void Taskthree_uart(void *xTask3)
+{
+  while (1)
+  {
+    read_usart();
+    Serial.printf("EN");
+    delay(10);
+  }
+}
+
+void setup()
+{
+  // 串口通信初始化
+  MySerial.begin(115200, SERIAL_8N1, 5, 17); // rxpin  txpin
+  // clear_usart_buffer();
+  //  PID结构体初始化
+  PID_pitch.kp = 0.0062;
+  PID_pitch.ki = 0.004;
+  PID_pitch.kd = 0;
+  PID_pitch.error_sum = 0;
+  PID_pitch.last_error = 0;
+  PID_yaw.kp = 0.025;
+  PID_yaw.ki = 0;
+  PID_yaw.kd = 0;
+  PID_yaw.error_sum = 0;
+  PID_yaw.last_error = 0;
+
+  // // i2c编码器链接驱动器
+  I2Cone.begin(0, 4, 400000);
+  sensor_i2c.init(&I2Cone);
+  motor_yaw.linkSensor(&sensor_i2c);
+
+  // pwm编码器链接驱动器
+  sensor_pwm.init();
+  sensor_pwm.enableInterrupt(doPWM);
+  motor_pitch.linkSensor(&sensor_pwm);
+
+  // driver config
+  // power supply voltage [V]
+  driver_yaw.voltage_power_supply = 12;
+  driver_yaw.init();
+  driver_pitch.voltage_power_supply = 12;
+  driver_pitch.init();
+  // link the motor and the driver
+  motor_yaw.linkDriver(&driver_yaw);
+  motor_pitch.linkDriver(&driver_pitch);
+
+  // choose FOC modulation (optional)
+  motor_yaw.foc_modulation = FOCModulationType::SinePWM;
+  motor_pitch.foc_modulation = FOCModulationType::SinePWM;
+
+  // set motion control loop to be used
+  motor_yaw.controller = MotionControlType::velocity; // torque,velocity,angle
+  motor_pitch.controller = MotionControlType::velocity;
+
+  /************yaw motor pid******************/
+  // velocity loop PID
+  motor_yaw.PID_velocity.P = 0.25;
+  motor_yaw.PID_velocity.I = 0.5;
+  motor_yaw.PID_velocity.D = 0.0;
+  motor_yaw.PID_velocity.output_ramp = 1000.0;
+  motor_yaw.PID_velocity.limit = 4.0;
+  motor_yaw.voltage_sensor_align = 2.5;
+  // Low pass filtering time constant
+  motor_yaw.LPF_velocity.Tf = 0.15;
+  // // angle loop PID
+  // motor_yaw.P_angle.P = 9;
+  // motor_yaw.P_angle.I = 0.8;
+  // motor_yaw.P_angle.D = 0;
+  // motor_yaw.P_angle.output_ramp = 0.0;
+  // motor_yaw.P_angle.limit = 20.0;
+  // // Low pass filtering time constant
+  // motor_yaw.LPF_angle.Tf = 0;
+
+  // Limits
+  motor_yaw.velocity_limit = 40.0;
+  motor_yaw.voltage_limit = 6.0;
+  motor_yaw.current_limit = 2.0;
+  /*********************************************/
+
+  /************pitch motor pid******************/
+  // velocity loop PID
+  motor_pitch.PID_velocity.P = 0.2;
+  motor_pitch.PID_velocity.I = 0.05;
+  motor_pitch.PID_velocity.D = 0;
+  motor_pitch.PID_velocity.output_ramp = 1000.0;
+  motor_pitch.PID_velocity.limit = 4.0;
+  motor_pitch.voltage_sensor_align = 2;
+  // Low pass filtering time constant
+  motor_pitch.LPF_velocity.Tf = 0.3;
+  // // angle loop PID
+  // motor_pitch.P_angle.P = 7;
+  // motor_pitch.P_angle.I = 0.8;
+  // motor_pitch.P_angle.D = 0;
+  // motor_pitch.P_angle.output_ramp = 0.0;
+  // motor_pitch.P_angle.limit = 20.0;
+  // // Low pass filtering time constant
+  // motor_pitch.LPF_angle.Tf = 0.1;
+
+  // Limits
+  motor_pitch.velocity_limit = 40.0;
+  motor_pitch.voltage_limit = 6.0;
+  motor_pitch.current_limit = 2.0;
+  /*********************************************/
+
+  // use monitoring with serial
+  Serial.begin(115200);
+  // comment out if not needed
+  // motor_yaw.useMonitoring(Serial);
+  // motor_pitch.useMonitoring(Serial);
+
+  // initialize motor_yaw
+  motor_yaw.init();
+  motor_pitch.init();
+  // align sensor and start FOC
+  motor_yaw.initFOC();
+  motor_pitch.initFOC();
+
+  // add target command T
+  command.add('Y', doTarget_yaw, (char *)"target angle");
+  command.add('P', doTarget_pitch, (char *)"target angle");
+  command.add('M', doMotor_yaw, (char *)"my motor");
+  command.add('N', doMotor_pitch, (char *)"my motor");
+
+  Serial.println(F("All motor ready."));
+  Serial.println(F("Set the target angle using serial terminal:"));
+
+  pinMode(22, OUTPUT);
+
+  xTaskCreatePinnedToCore(TaskOne_motor_yaw, "TaskOne", 10000, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(TaskTwo_motor_pitch, "TaskTwo", 10000, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(Taskthree_uart, "TaskThree", 10000, NULL, 1, NULL, 0);
+  //_delay(1000);
+}
+
+// angle set point variable
+// float target_angle = 0;
+
+void loop()
+{
+}
