@@ -14,3 +14,7 @@
 ## 机械部分
 
 **models** 文件夹包含机械模型，采用3d打印。
+
+## 目标跟踪算法
+
+**Target_Tracking** 文件夹包含yolov5_Bytetrack算法，已验证。
